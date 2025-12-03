@@ -1,0 +1,25 @@
+POMDP Multilingual Chatbot Setup
+=================================
+AA228/CS238 Project
+
+1. Install dependencies:
+   pip install -r requirements.txt
+
+2. Set up API key (for Together API model):
+   Create a .env file with:
+   TOGETHER_API_KEY=your_key_here
+
+   Get key from: https://api.together.xyz/
+
+3. Run the app:
+   streamlit run app.py
+
+4. Test POMDP backend:
+   python pomdp_backend.py
+
+Usage Tips
+----------
+- Try mixing English and Chinese in your messages
+- Watch the sidebar for POMDP belief updates
+- Toggle POMDP on/off to compare behavior
+- Use "Qwen 2.5 (Local)" if you don't have API key
