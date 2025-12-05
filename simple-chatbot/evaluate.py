@@ -21,10 +21,17 @@ def tag_sentence(text):
     return out
 
 def cmi_from_tags(tagged):
+    """
+    Code-Mixing Index in PERCENT (0–50).
+
+    CMI = 100 * min(en, zh) / (en + zh)
+    """
     zh = sum(1 for _, l in tagged if l == "zh")
     en = sum(1 for _, l in tagged if l == "en")
     total = zh + en
-    return min(zh, en)/total if total > 0 else 0.0
+    if total == 0:
+        return 0.0
+    return 100.0 * min(zh, en) / total
 
 # -------------------------
 # Load utterances
@@ -36,12 +43,15 @@ CHUNK_SIZE = 20
 with open(DATA_PATH, "r", encoding="utf-8") as f:
     speaker_sessions = json.load(f)
 
-# Flatten and chunk
+# Flatten and chunk: each chunk = one "conversation" (up to 20 utterances)
 conversations = []
 for key, utterances in speaker_sessions.items():
     for i in range(0, len(utterances), CHUNK_SIZE):
-        chunk = utterances[i:i+CHUNK_SIZE]
-        chunk_cmi = [{"text": s, "cmi": cmi_from_tags(tag_sentence(s))} for s in chunk]
+        chunk = utterances[i:i + CHUNK_SIZE]
+        chunk_cmi = [
+            {"text": s, "cmi": cmi_from_tags(tag_sentence(s))}
+            for s in chunk
+        ]
         conversations.append(chunk_cmi)
 
 print(f"Prepared {len(conversations)} conversations.")
@@ -74,15 +84,15 @@ for conv_idx, conversation in enumerate(tqdm(conversations, desc="Processing con
         if (conv_idx, turn_idx) in processed_turns:
             continue  # skip already processed
 
-        text = msg['text']
-        input_cmi = msg['cmi']
+        text = msg["text"]
+        input_cmi = msg["cmi"]  # already in percent
 
         try:
             reply = bot.chat(text)
         except Exception as e:
             reply = f"[ERROR] {e}"
 
-        output_cmi = cmi_from_tags(tag_sentence(reply))
+        output_cmi = cmi_from_tags(tag_sentence(reply))  # percent
 
         row = {
             "conversation_idx": conv_idx,
@@ -92,7 +102,7 @@ for conv_idx, conversation in enumerate(tqdm(conversations, desc="Processing con
             "input_cmi": input_cmi,
             "output_cmi": output_cmi,
             "pomdp_action": bot.get_last_action(),
-            "belief": bot.get_belief()
+            "belief": bot.get_belief(),
         }
 
         # Incremental save
