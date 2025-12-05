@@ -40,9 +40,8 @@ with st.sidebar:
     # Model selection
     model_choice = st.radio(
         "Choose Model:",
-        ["Llama 3.1 (Together API)", "Qwen 2.5 (Local)"],
-        help="Together API requires TOGETHER_API_KEY. Local model is free but slower."
-    )
+        ["Llama 3.1 (Together API)", "Qwen 2.5 (Local)", "Mistral (Hugging Face Inference API)"],
+        help="Together API requires TOGETHER_API_KEY. Local model is free but slower. Mistral via API requires HUGGINGFACEHUB_API_TOKEN.")
     
     st.divider()
     
@@ -133,6 +132,13 @@ needs_reinit = (
     st.session_state.use_pomdp != use_pomdp
 )
 
+current_model = (
+    "together" if "Llama" in model_choice else
+    "mistral" if "Mistral" in model_choice else
+    "local"
+)
+
+
 if needs_reinit:
     if current_model == "together":
         if not os.getenv("TOGETHER_API_KEY"):
@@ -142,6 +148,13 @@ if needs_reinit:
         from chatbot import TogetherChat
         with st.spinner("Connecting to Together API..."):
             st.session_state.bot = TogetherChat(use_pomdp=use_pomdp)
+    elif current_model == "mistral":
+        if not os.getenv("HUGGINGFACEHUB_API_TOKEN"):
+            st.error("⚠️ HUGGINGFACEHUB_API_TOKEN not found. Add it to .env file.")
+            st.stop()
+        from chatbot import MistralChat
+        with st.spinner("Connecting to Mistral via Inference API..."):
+            st.session_state.bot = MistralChat(use_pomdp=use_pomdp)
     else:
         try:
             # Import only when needed (may fail if transformers broken)

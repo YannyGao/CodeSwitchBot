@@ -17,6 +17,32 @@ import os
 from openai import OpenAI
 from pomdp_backend import POMDPLanguagePolicy
 
+# third-party imports
+try:
+    import requests
+except Exception as e:
+    # make the error more actionable
+    raise ImportError(
+        "Missing dependency 'requests'. Install with: pip install requests\n"
+        f"Original error: {e}"
+    )
+from dotenv import load_dotenv
+import os
+
+try:
+    from mistralai import Mistral
+except Exception as e:
+    raise ImportError(
+        "Missing dependency 'mistralai'. Install with: pip install mistralai\n"
+        f"Original error: {e}"
+    )
+
+load_dotenv()  # reads .env and sets environment variables
+
+# check that token is loaded
+print(os.environ.get("TOGETHER_API_KEY"))
+print(os.environ.get("HUGGINGFACE_HUB_TOKEN"))
+
 
 class TogetherChat:
     """
@@ -131,6 +157,160 @@ class TogetherChat:
             self.policy.reset()
         self.last_pomdp_info = None
 
+
+class MistralChat:
+    """
+    Mistral model via official mistralai SDK (direct to Mistral).
+    Integrates with the POMDP policy the same way as TogetherChat/LocalChat.
+    """
+    def __init__(self, model: str = "mistral-medium-latest", use_pomdp: bool = True):
+        """
+        Args:
+            model: Mistral model id (e.g. "mistral-medium-latest", "mistral-large-latest")
+            use_pomdp: whether to use POMDP policy for language decisions
+        """
+        self.model = model
+        self.api_key = os.getenv("MISTRAL_API_KEY")
+        if not self.api_key:
+            raise EnvironmentError(
+                "MISTRAL_API_KEY not set. Set it in .env or environment to use the Mistral API."
+            )
+
+        # Create client (the SDK typically expects api_key kwarg)
+        # If the SDK signature changes, adjust accordingly
+        self.client = Mistral(api_key=self.api_key)
+
+        # conversation history (optional; for simple stateless calls only the current message is needed)
+        self.history = []
+
+        # POMDP policy
+        self.use_pomdp = use_pomdp
+        self.policy = POMDPLanguagePolicy() if use_pomdp else None
+        self.last_pomdp_info = None
+
+    def _extract_text_from_response(self, resp):
+        """
+        Try several plausible shapes returned by mistralai client.chat.complete.
+        This is defensive: exact SDK return shape may be an object with attributes
+        or a dict with fields; adjust if needed for your SDK version.
+        """
+        # If SDK returns an object with a simple 'content' or 'completion' attribute
+        if hasattr(resp, "content"):
+            return getattr(resp, "content")
+        if hasattr(resp, "completion"):
+            return getattr(resp, "completion")
+        # If the SDK returns a structure with generations / choices
+        try:
+            # common shapes
+            if isinstance(resp, dict):
+                # e.g., {"completion": "..."} or {"output": "..."} or {"choices": [{"text": "..."}]}
+                if "completion" in resp and isinstance(resp["completion"], str):
+                    return resp["completion"]
+                if "output" in resp and isinstance(resp["output"], str):
+                    return resp["output"]
+                if "generated_text" in resp and isinstance(resp["generated_text"], str):
+                    return resp["generated_text"]
+                if "choices" in resp and isinstance(resp["choices"], list) and resp["choices"]:
+                    first = resp["choices"][0]
+                    if isinstance(first, dict):
+                        for key in ("text", "content", "message", "generated_text"):
+                            if key in first and isinstance(first[key], str):
+                                return first[key]
+                        # sometimes HF-like: first["message"]["content"]
+                        if "message" in first and isinstance(first["message"], dict):
+                            msg = first["message"]
+                            if "content" in msg:
+                                return msg["content"]
+                # fallback: join text fields
+                for v in ("text", "completion", "generated_text", "output"):
+                    if v in resp and isinstance(resp[v], str):
+                        return resp[v]
+            # If object-like with nested structure
+            if hasattr(resp, "generations") and resp.generations:
+                g0 = resp.generations[0]
+                if hasattr(g0, "text"):
+                    return g0.text
+                if isinstance(g0, dict) and "text" in g0:
+                    return g0["text"]
+        except Exception:
+            pass
+
+        # Last resort: stringified JSON
+        try:
+            return json.dumps(resp, ensure_ascii=False)
+        except Exception:
+            return str(resp)
+
+    def _call_mistral(self, messages, temperature: float = 0.7, max_tokens: int = 512):
+        """
+        Call the Mistral client.chat.complete API.
+        messages should be a list of {"role": "...", "content": "..."} dicts.
+        """
+        # The sample you provided used client.chat.complete(model=..., messages=[...])
+        # Add other params as supported by your SDK (e.g., temperature, max_tokens)
+        try:
+            resp = self.client.chat.complete(
+                model=self.model,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+        except Exception as e:
+            # propagate useful error
+            raise RuntimeError(f"Mistral API call failed: {e}")
+
+        text = self._extract_text_from_response(resp)
+        return text.strip() if isinstance(text, str) else str(text)
+
+    def chat(self, message: str) -> str:
+        """
+        Process user message, optionally use POMDP to condition the system prompt,
+        then send to Mistral and return the assistant text.
+        """
+        # 1) POMDP: select action and system prompt
+        if self.use_pomdp and self.policy:
+            action, info = self.policy.select_action(message)
+            self.last_pomdp_info = info
+            system_prompt = self.policy.get_system_prompt(action, info["cmi"])
+        else:
+            system_prompt = "You are a helpful bilingual assistant."
+            self.last_pomdp_info = None
+
+        # 2) Build messages for Mistral chat format
+        # Mistral sample uses role/message dicts; follow same shape
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": message},
+        ]
+        # Optionally include history if you want multi-turn context
+        # e.g., extend messages with previous user/assistant entries from self.history
+
+        # 3) Call API
+        reply_text = self._call_mistral(messages, temperature=0.7, max_tokens=500)
+
+        # 4) Update history
+        self.history.append({"role": "user", "content": message})
+        self.history.append({"role": "assistant", "content": reply_text})
+
+        return reply_text
+
+    def get_belief(self):
+        return self.policy.get_belief() if self.policy else None
+
+    def get_last_action(self):
+        return self.policy.get_last_action() if self.policy else None
+
+    def get_last_cmi(self):
+        return self.policy.get_last_cmi() if self.policy else 0.0
+
+    def get_last_pomdp_info(self):
+        return self.last_pomdp_info
+
+    def reset(self):
+        self.history = []
+        if self.policy:
+            self.policy.reset()
+        self.last_pomdp_info = None
 
 class LocalChat:
     """

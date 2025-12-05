@@ -1,73 +1,103 @@
 import json
 from tqdm import tqdm
-import os
-from chatbot import LocalChat  # or TogetherChat
+import re
+from chatbot import MistralChat  # import your class
 
 # -------------------------
-# Config
+# CMI helpers
 # -------------------------
-DATA_PATH = "simple-chatbot/sample_sentences.json"
-OUT_PATH = "qwen_pomdp_outputs.jsonl"
-MODEL_NAME = "Qwen/Qwen2.5-1.5B-Instruct"
-USE_POMDP = True
-CHUNK_SIZE = 20  # messages per mini-conversation
+def tag_sentence(text):
+    zh = re.compile(r"[\u4e00-\u9fff]")
+    en = re.compile(r"[a-zA-Z]")
+    tokens = re.findall(r"[\u4e00-\u9fff]|[a-zA-Z]+|[^\s]", text)
+    out = []
+    for t in tokens:
+        if zh.search(t):
+            out.append((t, "zh"))
+        elif en.search(t):
+            out.append((t, "en"))
+        else:
+            out.append((t, "other"))
+    return out
+
+def cmi_from_tags(tagged):
+    zh = sum(1 for _, l in tagged if l == "zh")
+    en = sum(1 for _, l in tagged if l == "en")
+    total = zh + en
+    return min(zh, en)/total if total > 0 else 0.0
 
 # -------------------------
-# Prepare output file
+# Load utterances
 # -------------------------
-with open(OUT_PATH, "w", encoding="utf-8") as f:
+DATA_PATH = "simple-chatbot/utterances_by_speaker_session.json"
+OUT_PATH = "mistral_pomdp_outputs.jsonl"
+CHUNK_SIZE = 20
+
+with open(DATA_PATH, "r", encoding="utf-8") as f:
+    speaker_sessions = json.load(f)
+
+# Flatten and chunk
+conversations = []
+for key, utterances in speaker_sessions.items():
+    for i in range(0, len(utterances), CHUNK_SIZE):
+        chunk = utterances[i:i+CHUNK_SIZE]
+        chunk_cmi = [{"text": s, "cmi": cmi_from_tags(tag_sentence(s))} for s in chunk]
+        conversations.append(chunk_cmi)
+
+print(f"Prepared {len(conversations)} conversations.")
+
+# -------------------------
+# Load existing results (if any)
+# -------------------------
+processed_turns = set()
+try:
+    with open(OUT_PATH, "r", encoding="utf-8") as f:
+        for line in f:
+            row = json.loads(line)
+            processed_turns.add((row["conversation_idx"], row["turn_idx"]))
+except FileNotFoundError:
     pass
 
-# -------------------------
-# Load dataset
-# -------------------------
-with open(DATA_PATH, "r", encoding="utf-8") as f:
-    sentences = json.load(f)
-
-print(f"Loaded {len(sentences)} sentences.")
+print(f"Found {len(processed_turns)} already processed turns. Will skip them.")
 
 # -------------------------
-# Split dataset into chunks
+# Initialize Mistral chatbot
 # -------------------------
-chunks = [sentences[i:i+CHUNK_SIZE] for i in range(0, len(sentences), CHUNK_SIZE)]
+bot = MistralChat(model="mistral-medium-latest", use_pomdp=True)
 
 # -------------------------
-# Initialize chatbot (once!)
+# Run conversations
 # -------------------------
-print("Initializing chatbot...")
-bot = LocalChat(model=MODEL_NAME, use_pomdp=USE_POMDP)
-device = "cuda" if hasattr(bot.pipe.model, "device") and str(bot.pipe.model.device) != "cpu" else "cpu"
-print(f"Using device: {device}")
+for conv_idx, conversation in enumerate(tqdm(conversations, desc="Processing conversations")):
+    bot.reset()
+    for turn_idx, msg in enumerate(conversation):
+        if (conv_idx, turn_idx) in processed_turns:
+            continue  # skip already processed
 
-results = []
+        text = msg['text']
+        input_cmi = msg['cmi']
 
-# -------------------------
-# Run chatbot
-# -------------------------
-for chunk_idx, chunk in enumerate(tqdm(chunks, desc="Processing chunks")):
-    # Reset POMDP for new mini-conversation
-    if USE_POMDP:
-        bot.reset()
-
-    for text in tqdm(chunk, desc=f"Chunk {chunk_idx+1}", leave=False):
         try:
             reply = bot.chat(text)
         except Exception as e:
             reply = f"[ERROR] {e}"
 
+        output_cmi = cmi_from_tags(tag_sentence(reply))
+
         row = {
+            "conversation_idx": conv_idx,
+            "turn_idx": turn_idx,
             "input_text": text,
             "output_text": reply,
+            "input_cmi": input_cmi,
+            "output_cmi": output_cmi,
             "pomdp_action": bot.get_last_action(),
-            "user_cmi": bot.get_last_cmi(),
-            "belief": bot.get_belief(),
+            "belief": bot.get_belief()
         }
-
-        results.append(row)
 
         # Incremental save
         with open(OUT_PATH, "a", encoding="utf-8") as out_f:
             out_f.write(json.dumps(row, ensure_ascii=False) + "\n")
             out_f.flush()
 
-print(f"\n✅ Finished! Results saved to {OUT_PATH}")
+print(f"✅ Finished! Results saved to {OUT_PATH}")
